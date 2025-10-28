@@ -1,27 +1,16 @@
-# CSStats Live API (clean)
+# CSStats Live API
 
-FastAPI service that returns **KD**, **Premier rating (csficacao)**, and **Faceit level** for a CSStats player page.
+Endpoints:
+- `GET /health` -> {"ok": true}
+- `GET /player/{steam_id}/summary` -> { kd, csficacao, faceit_level, ... }
+- `GET /player/{steam_id}` -> alias de `/summary`
+- `GET /premier/{steam_id}` -> só premier (compat)
+- `GET /player/{steam_id}/live` -> sample (opcional)
 
-## Endpoints
-
-- `GET /health`
-- `GET /player/{steam_id}/summary`
-- `GET /premier/{steam_id}`
-
-## Local dev
-
+## Local
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-python -m playwright install
+python -m playwright install  # só se for rodar fora do Docker
 uvicorn app.main:app --reload --port 8000
-```
-
-## Deploy to Koyeb (Buildpack)
-
-1. Push to GitHub.
-2. Create Web Service from the repo.
-3. Builder: **Buildpack**.
-4. Ports: TCP 8000 health check.
-5. Deploy.
