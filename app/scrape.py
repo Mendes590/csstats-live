@@ -2,12 +2,10 @@ from __future__ import annotations
 from typing import Optional, Dict, Any
 import re
 import contextlib
-
 from playwright.sync_api import sync_playwright
 
 CSSTATS_BASE = "https://csstats.gg/player/{steamid}"
 
-# números tipo 13,748 ou 13748
 NUM_GROUPED = re.compile(r"\b(\d{1,3}(?:,\d{3})+|\d{3,6})\b")
 DECIMAL = re.compile(r"\b\d+\.\d+\b")
 FACEIT_LEVEL = re.compile(r"faceit/level(\d+)\.png", re.I)
@@ -31,10 +29,6 @@ def _first_decimal(text: str) -> Optional[float]:
 
 
 def _extract_premier(inner_text: str) -> Optional[int]:
-    """
-    Tenta achar o bloco de Premier (S3) e extrair o número tipo 13,748 -> 13748.
-    Se não achar S3 explicitamente, tenta o primeiro número grande no texto.
-    """
     txt = inner_text or ""
     hit = re.search(r"Premier\s*-\s*Season\s*3|Premier[\s\S]{0,200}\bS3\b", txt, re.I)
     if not hit:
@@ -45,51 +39,64 @@ def _extract_premier(inner_text: str) -> Optional[int]:
     return rating
 
 
-def _launch_browser(p):
-    # flags essenciais pra rodar headless em cloud
-    return p.chromium.launch(
+def _new_browser_context(p):
+    # Flags para rodar bem em ambientes de container (Koyeb/Heroku etc)
+    browser = p.chromium.launch(
         headless=True,
-        args=["--no-sandbox", "--disable-dev-shm-usage"]
+        args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--single-process",
+            "--no-zygote",
+        ],
     )
+    context = browser.new_context(
+        user_agent=("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"),
+        viewport={"width": 1440, "height": 900},
+        locale="en-US",
+        timezone_id="America/Sao_Paulo",
+    )
+    # Bloqueia mídia pesada para carregar mais rápido/estável
+    context.route("**/*", lambda route: (
+        route.abort() if route.request.resource_type in {"image", "media", "font"} else route.continue_()
+    ))
+    return browser, context
 
 
 def scrape_player(steam_id: str) -> Dict[str, Any]:
     url = CSSTATS_BASE.format(steamid=steam_id)
 
     with sync_playwright() as p:
-        browser = _launch_browser(p)
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1440, "height": 900},
-            locale="en-US",
-            timezone_id="America/Sao_Paulo",
-        )
+        browser, context = _new_browser_context(p)
         page = context.new_page()
-        page.set_default_timeout(45000)
+        page.set_default_timeout(45000)  # 45s
 
-        # 'domcontentloaded' é mais estável que 'networkidle' em prod
-        page.goto(url, wait_until="domcontentloaded")
-        with contextlib.suppress(Exception):
-            page.wait_for_timeout(800)
-            page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(300)
-            page.evaluate("() => window.scrollTo(0, 0)")
+        # pequena política de retry
+        last_err = None
+        for _ in range(2):
+            try:
+                page.goto(url, wait_until="load")
+                with contextlib.suppress(Exception):
+                    page.wait_for_timeout(600)
+                    page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+                    page.wait_for_timeout(300)
+                    page.evaluate("() => window.scrollTo(0, 0)")
+                break
+            except Exception as e:
+                last_err = e
+        if last_err:
+            browser.close()
+            raise last_err
 
         inner_text = ""
-        html = ""
         with contextlib.suppress(Exception):
             inner_text = page.evaluate("() => document.body.innerText || ''") or ""
-        with contextlib.suppress(Exception):
-            html = page.content() or ""
 
-        # csficacao (Premier rating)
         premier = _extract_premier(inner_text)
 
-        # faceit level pelo src da imagem
         faceit_level = None
         try:
             img = page.locator('img.rank[src*="faceit/level"]').first
@@ -101,8 +108,8 @@ def scrape_player(steam_id: str) -> Dict[str, Any]:
         except Exception:
             pass
 
-        # KD — tenta por proximidade de cards; cai para regex no texto
         kd_value = None
+        # tenta perto do card "K/D"
         try:
             kd_block = page.locator('css=*, text=/^\\s*K\\/D\\s*$/i').first
             if kd_block and kd_block.count() > 0:
@@ -133,13 +140,11 @@ def scrape_player(steam_id: str) -> Dict[str, Any]:
                 pass
 
         if kd_value is None:
-            m = re.search(r"K\/D[\s\S]{0,160}?(\d+\.\d+)", inner_text, re.I)
-            if not m:
-                m = re.search(r"HLTV\s*RATING[\s\S]{0,160}?(\d+\.\d+)", inner_text, re.I)
+            m = re.search(r"K\/D[\s\S]{0,160}?(\d+\.\d+)", inner_text, re.I) \
+                or re.search(r"HLTV\s*RATING[\s\S]{0,160}?(\d+\.\d+)", inner_text, re.I)
             if m:
                 kd_value = float(m.group(1))
 
-        context.close()
         browser.close()
 
     return {
@@ -153,23 +158,5 @@ def scrape_player(steam_id: str) -> Dict[str, Any]:
 
 def scrape_premier_only(steam_id: str):
     d = scrape_player(steam_id)
-    return {
-        "premier": {"season": "S3", "rating": d.get("csficacao")},
-        "csstats_profile": d.get("csstats_profile")
-    }
-
-
-def scrape_live_sample(steam_id: str) -> Dict[str, Any]:
-    """
-    Exemplo simples de 'live'. Ajuste se precisar extrair algo específico.
-    """
-    url = CSSTATS_BASE.format(steamid=steam_id) + "/live"
-    with sync_playwright() as p:
-        browser = _launch_browser(p)
-        page = browser.new_page()
-        page.set_default_timeout(45000)
-        page.goto(url, wait_until="domcontentloaded")
-        page.wait_for_timeout(1000)
-        text = page.evaluate("() => document.body.innerText || ''") or ""
-        browser.close()
-    return {"steam_id": steam_id, "live_text_sample": text[:800], "url": url}
+    return {"premier": {"season": "S3", "rating": d.get("csficacao")},
+            "csstats_profile": d.get("csstats_profile")}
