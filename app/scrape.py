@@ -1,8 +1,10 @@
+# app/scrape.py
 from __future__ import annotations
 from typing import Optional, Dict, Any
 import re
 import contextlib
 import time
+import threading
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError, Error as PWError
 
@@ -12,23 +14,19 @@ NUM_GROUPED = re.compile(r"\b(\d{1,3}(?:,\d{3})+|\d{3,6})\b")
 DECIMAL = re.compile(r"\b\d+\.\d+\b")
 FACEIT_LEVEL = re.compile(r"faceit/level(\d+)\.png", re.I)
 
-
 def _to_int(s: str) -> Optional[int]:
     try:
         return int(s.replace(",", ""))
     except Exception:
         return None
 
-
 def _first_int(text: str) -> Optional[int]:
     m = NUM_GROUPED.search(text or "")
     return _to_int(m.group(1)) if m else None
 
-
 def _first_decimal(text: str) -> Optional[float]:
     m = DECIMAL.search(text or "")
     return float(m.group(0)) if m else None
-
 
 def _extract_premier(inner_text: str) -> Optional[int]:
     txt = inner_text or ""
@@ -40,14 +38,15 @@ def _extract_premier(inner_text: str) -> Optional[int]:
     rating = _first_int(scope)
     return rating
 
-
 LAUNCH_ARGS = [
     "--no-sandbox",
     "--disable-setuid-sandbox",
     "--disable-dev-shm-usage",
     "--disable-gpu",
-    "--single-process",
-    "--no-zygote",
+    # IMPORTANTE: em instâncias muito magras, o --single-process pode instabilizar.
+    # Vamos REMOVER para ficar mais estável no Koyeb Free.
+    # "--single-process",
+    # "--no-zygote",
     "--disable-extensions",
     "--disable-background-networking",
     "--disable-background-timer-throttling",
@@ -68,30 +67,75 @@ LAUNCH_ARGS = [
     "--js-flags=--max-old-space-size=128",
 ]
 
+# ---------- Singleton Playwright Manager (browser global + fila) ----------
 
-def _new_browser_context(p):
-    browser = p.chromium.launch(headless=True, args=LAUNCH_ARGS)
-    context = browser.new_context(
-        user_agent=(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        viewport={"width": 1366, "height": 768},
-        locale="en-US",
-        timezone_id="America/Sao_Paulo",
-    )
-    # Bloqueia recursos pesados
-    def _router(route):
-        rtype = route.request.resource_type
-        if rtype in {"image", "media", "font"}:
-            return route.abort()
-        return route.continue_()
+class _PWManager:
+    _lock = threading.RLock()
+    _inited = False
+    _play = None
+    _browser = None
+    _context = None
+    _semaphore = threading.Semaphore(1)  # 1 requisição por vez
 
-    context.route("**/*", _router)
+    @classmethod
+    def start(cls):
+        with cls._lock:
+            if cls._inited:
+                return
+            cls._play = sync_playwright().start()
+            browser = cls._play.chromium.launch(headless=True, args=LAUNCH_ARGS)
+            context = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1366, "height": 768},
+                locale="en-US",
+                timezone_id="America/Sao_Paulo",
+            )
 
-    return browser, context
+            # Bloquear assets pesados
+            def _router(route):
+                rtype = route.request.resource_type
+                if rtype in {"image", "media", "font"}:
+                    return route.abort()
+                return route.continue_()
 
+            context.route("**/*", _router)
+
+            cls._browser = browser
+            cls._context = context
+            cls._inited = True
+
+    @classmethod
+    def stop(cls):
+        with cls._lock:
+            if not cls._inited:
+                return
+            with contextlib.suppress(Exception):
+                if cls._context:
+                    cls._context.close()
+            with contextlib.suppress(Exception):
+                if cls._browser:
+                    cls._browser.close()
+            with contextlib.suppress(Exception):
+                if cls._play:
+                    cls._play.stop()
+            cls._browser = None
+            cls._context = None
+            cls._play = None
+            cls._inited = False
+
+    @classmethod
+    def with_page(cls):
+        # garante inicializado
+        if not cls._inited:
+            cls.start()
+        # 1 por vez no Free
+        return cls._semaphore, cls._context.new_page()
+
+# ---------- Scraping helpers ----------
 
 def _goto_with_retries(page, url: str, tries: int = 2, wait_state: str = "domcontentloaded"):
     last = None
@@ -108,17 +152,18 @@ def _goto_with_retries(page, url: str, tries: int = 2, wait_state: str = "domcon
             return
         except (PWTimeoutError, PWError) as e:
             last = e
-            # pequeno backoff
             page.wait_for_timeout(400)
+            # Em caso de page crash, recria a page e tenta de novo:
+            try:
+                page = page.context.new_page()
+            except Exception:
+                pass
     if last:
         raise last
 
-
 def _extract_values(page, inner_text: str) -> Dict[str, Any]:
-    # Premier
     premier = _extract_premier(inner_text)
 
-    # Faceit level
     faceit_level = None
     try:
         img = page.locator('img.rank[src*="faceit/level"]').first
@@ -130,7 +175,6 @@ def _extract_values(page, inner_text: str) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # KD
     kd_value = None
     try:
         kd_block = page.locator('css=*, text=/^\\s*K\\/D\\s*$/i').first
@@ -169,57 +213,42 @@ def _extract_values(page, inner_text: str) -> Dict[str, Any]:
 
     return {"kd": kd_value, "csficacao": premier, "faceit_level": faceit_level}
 
+# ---------- API-level functions ----------
 
 def scrape_player(steam_id: str) -> Dict[str, Any]:
     url = CSSTATS_BASE.format(steamid=steam_id)
 
-    with sync_playwright() as p:
-        # Duas tentativas completas: se o navegador morrer (TargetClosedError),
-        # reabrimos um novo browser/context e tentamos novamente.
+    # 1 por vez no Free (evita matar o browser)
+    sema, page = _PWManager.with_page()
+    with sema:
         last_err = None
-        for attempt in range(2):
-            browser = context = page = None
-            try:
-                browser, context = _new_browser_context(p)
-                page = context.new_page()
-                _goto_with_retries(page, url, tries=2, wait_state="domcontentloaded")
+        try:
+            _goto_with_retries(page, url, tries=2, wait_state="domcontentloaded")
 
-                inner_text = ""
-                with contextlib.suppress(Exception):
-                    inner_text = page.evaluate("() => document.body.innerText || ''") or ""
+            inner_text = ""
+            with contextlib.suppress(Exception):
+                inner_text = page.evaluate("() => document.body.innerText || ''") or ""
 
-                data = _extract_values(page, inner_text)
-                data.update({
-                    "steam_id": steam_id,
-                    "csstats_profile": url,
-                })
+            data = _extract_values(page, inner_text)
+            data.update({"steam_id": steam_id, "csstats_profile": url})
+            return data
+        except PWError as e:
+            last_err = e
+            # Se o alvo fechou, tenta uma única vez recriar tudo:
+            _PWManager.stop()
+            _PWManager.start()
+            # Re-tenta uma vez:
+            sema2, page2 = _PWManager.with_page()
+            with sema2:
+                _goto_with_retries(page2, url, tries=1, wait_state="domcontentloaded")
+                inner_text = page2.evaluate("() => document.body.innerText || ''") or ""
+                data = _extract_values(page2, inner_text)
+                data.update({"steam_id": steam_id, "csstats_profile": url})
                 return data
-            except PWError as e:
-                # guarda erro e tenta reabrir tudo do zero
-                last_err = e
-                try:
-                    if browser:
-                        browser.close()
-                except Exception:
-                    pass
-                time.sleep(0.6)
-                continue
-            finally:
-                with contextlib.suppress(Exception):
-                    if browser:
-                        browser.close()
-
-        # Se chegou aqui, falhou 2x:
-        if last_err:
-            raise last_err
-
-    # fallback impossível de chegar aqui, mas retorna algo seguro
-    return {"steam_id": steam_id, "kd": None, "csficacao": None, "faceit_level": None, "csstats_profile": url}
-
+        finally:
+            with contextlib.suppress(Exception):
+                page.close()
 
 def scrape_premier_only(steam_id: str):
     d = scrape_player(steam_id)
-    return {
-        "premier": {"season": "S3", "rating": d.get("csficacao")},
-        "csstats_profile": d.get("csstats_profile"),
-    }
+    return {"premier": {"season": "S3", "rating": d.get("csficacao")}, "csstats_profile": d.get("csstats_profile")}

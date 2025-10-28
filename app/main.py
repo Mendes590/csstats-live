@@ -1,8 +1,21 @@
+# app/main.py
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
-from app.scrape import scrape_player, scrape_premier_only
 
-app = FastAPI(title="CSStats Live API", version="1.0.0")
+from app.scrape import scrape_player, scrape_premier_only, _PWManager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # start
+    _PWManager.start()
+    try:
+        yield
+    finally:
+        # stop
+        _PWManager.stop()
+
+app = FastAPI(title="CSStats Live API", version="1.0.0", lifespan=lifespan)
 
 @app.get("/health")
 def health():
