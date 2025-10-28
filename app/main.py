@@ -2,18 +2,19 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
+from anyio import to_thread  # <- IMPORTANTE
 
 from app.scrape import scrape_player, scrape_premier_only, _PWManager
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # start
-    _PWManager.start()
+    # Inicia Playwright SÍNCRONO fora do event loop
+    await to_thread.run_sync(_PWManager.start)
     try:
         yield
     finally:
-        # stop
-        _PWManager.stop()
+        # Finaliza Playwright SÍNCRONO fora do event loop
+        await to_thread.run_sync(_PWManager.stop)
 
 app = FastAPI(title="CSStats Live API", version="1.0.0", lifespan=lifespan)
 
