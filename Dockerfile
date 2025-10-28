@@ -1,21 +1,23 @@
-FROM mcr.microsoft.com/playwright/python:v1.55.0-jammy
+# Use uma base Playwright alinhada à sua lib
+FROM mcr.microsoft.com/playwright/python:v1.45.0-jammy
 
 ENV PYTHONUNBUFFERED=1 \
+    PIP_ONLY_BINARY=:all: \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     NODE_OPTIONS=--max-old-space-size=128
 
 WORKDIR /app
 
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
 
-# (Opcional) Se vc não usar imagem base do Playwright, aí sim rodaria:
-# RUN playwright install --with-deps
+# Garante pip/setuptools/wheel atualizados e força greenlet/playwright binários
+RUN python -m pip install --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir -r requirements.txt && \
+    playwright install --with-deps
 
 COPY . .
 
 EXPOSE 8000
 
-# MUITO IMPORTANTE: usar $PORT que o Render injeta
-# e apenas 1 worker (para não abrir 2+ browsers no plano free)
+# Usar a porta que o Render injeta e APENAS 1 worker (evita 2 browsers no plano free)
 CMD ["sh", "-c", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]
